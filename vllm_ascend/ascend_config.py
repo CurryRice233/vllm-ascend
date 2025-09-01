@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 from typing import Optional
 
 from vllm.logger import logger
@@ -50,6 +51,22 @@ class AscendConfig:
         self.enable_shared_expert_dp = additional_config.get(
             "enable_shared_expert_dp", False
         ) and not self.torchair_graph_config.enabled and vllm_config.parallel_config.enable_expert_parallel
+
+        dual_batch_overlap_config = additional_config.get("dual_batch_overlap_config", {})
+        self.dual_batch_overlap_config = DualBatchOverlapConfig(**dual_batch_overlap_config)
+
+
+@dataclasses.dataclass
+class DualBatchOverlapConfig:
+    """
+    Configuration Object for dual_batch_overlap_config from additional_config
+    micro batch split config for split attention metadata
+    """
+    enabled: bool = False
+    # micro batch num
+    num_micro_batches: int = 2
+    # token num diff between split tokens
+    imbalance_ratio: float = 0.1
 
 
 class TorchairGraphConfig:

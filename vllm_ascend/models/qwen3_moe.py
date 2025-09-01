@@ -17,7 +17,7 @@
 # Adapted from vllm/model_executor/models/qwen3_moe.py
 # This file is a part of the vllm-ascend project.
 
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 
 import torch
 from torch import nn
@@ -47,6 +47,8 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory, make_layers, maybe_prefix)
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.dbo.dbo_manager import DualBatchOverlapManager
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.ops.sequence_parallel import (MetadataForPadding,
                                                init_metadata_for_sp)
@@ -243,6 +245,90 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
 
         return hidden_states, residual
 
+    def forward_generator(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        _metadata_for_padding: Optional[MetadataForPadding] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self._forward_comp_input_layernorm(hidden_states, residual, _metadata_for_padding)
+        yield
+        hidden_states = self._forward_comp_attn(positions, hidden_states, _metadata_for_padding)
+        yield
+        hidden_states, residual = self._froward_comp_post_attention_layernorm(hidden_states, residual)
+        yield
+        hidden_states = self._froward_comp_mlp(hidden_states, _metadata_for_padding)
+        yield hidden_states, residual
+
+    def _forward_comp_input_layernorm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        _metadata_for_padding: Optional[MetadataForPadding] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        # To prevent precision issues during the decoder phase when only prefilling enables SP
+        if not self.enable_sequence_parallelism:
+            self.self_attn.o_proj.reduce_results = True
+        else:
+            self.self_attn.o_proj.reduce_results = not _metadata_for_padding.not_dummy_and_is_prefill \
+                if _metadata_for_padding is not None else True
+
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            if _metadata_for_padding and _metadata_for_padding.not_dummy_and_is_prefill:
+                residual = _metadata_for_padding.padding_slice(residual)
+
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+
+            if _metadata_for_padding and _metadata_for_padding.not_dummy_and_is_prefill:
+                hidden_states = _metadata_for_padding.allgather_unpadding_aligned(
+                    hidden_states)
+        return hidden_states, residual
+
+    def _forward_comp_attn(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        _metadata_for_padding: Optional[MetadataForPadding] = None
+    ) -> torch.Tensor:
+
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+        if _metadata_for_padding and _metadata_for_padding.not_dummy_and_is_prefill:
+            hidden_states = _metadata_for_padding.padding_aligned_reduce_scatter(
+                hidden_states)
+        return hidden_states
+
+    def _froward_comp_post_attention_layernorm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        return hidden_states, residual
+
+    def _froward_comp_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        _metadata_for_padding: Optional[MetadataForPadding] = None
+    ) -> torch.Tensor:
+        if not self.use_aclgraph:
+            hidden_states = self.mlp(
+                hidden_states, _metadata_for_padding=_metadata_for_padding)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        return hidden_states
+
 
 @support_torch_compile
 class CustomQwen3MoeModel(Qwen3MoeModel):
@@ -280,6 +366,10 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
+        dbo_config = get_ascend_config().dual_batch_overlap_config
+        self.enable_dbo = dbo_config.enabled
+        if self.enable_dbo:
+            self.dbo_manager = DualBatchOverlapManager(dbo_config, self.layers[self.start_layer:self.end_layer])
 
     def forward(
         self,
@@ -299,13 +389,17 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-                _metadata_for_padding=_metadata_for_padding)
+        if self.enable_dbo:
+            hidden_states, residual = self.dbo_manager.run_forward(
+                positions, hidden_states, residual, _metadata_for_padding=_metadata_for_padding)
+        else:
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                    _metadata_for_padding=_metadata_for_padding)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
