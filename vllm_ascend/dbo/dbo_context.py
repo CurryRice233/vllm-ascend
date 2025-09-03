@@ -21,7 +21,7 @@ from vllm.forward_context import get_forward_context
 
 class DualBatchOverlapContext:
 
-    def __init__(self, forward_generator, stream, attn_metadata):
+    def __init__(self, stream, forward_generator=None, attn_metadata=None):
         self.origin_generator = forward_generator
         self.generator_with_context = None
         self.stream = stream

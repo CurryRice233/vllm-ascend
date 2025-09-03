@@ -39,8 +39,8 @@ class DualBatchOverlapManager:
         self.dbo_config = dbo_config
         self.layers = layers
         self.num_batch = dbo_config.num_micro_batches
-        # layer -> batch -> context
-        self.dbo_contexts: List[List[DualBatchOverlapContext]] = []
+        # batch -> context
+        self.dbo_contexts: List[DualBatchOverlapContext] = []
         self.use_mla = False
         self.init_dbo_streams()
         self.init_dbo_contexts()
@@ -56,16 +56,12 @@ class DualBatchOverlapManager:
 
     def init_dbo_contexts(self):
         """
-        iterate the layers;
         each layer contains a batch of contexts, each contexts use its own stream.
-        different layers can reuse streams.
+        different layers can reuse contexts.
         """
-        for layer in self.layers:
-            batch_dbo_context = []
-            for i in range(self.num_batch):
-                dbo_context = DualBatchOverlapContext(layer.forward_generator, self.DBO_STREAMS[i], None)
-                batch_dbo_context.append(dbo_context)
-            self.dbo_contexts.append(batch_dbo_context)
+        for i in range(self.num_batch):
+            dbo_context = DualBatchOverlapContext(self.DBO_STREAMS[i])
+            self.dbo_contexts.append(dbo_context)
 
     def run_forward(
         self,
@@ -86,15 +82,16 @@ class DualBatchOverlapManager:
         attn_metadata, [positions, hidden_states, residual] = \
             self._split_layer_inputs(attn_metadata, medata_cls, self.dbo_config, [positions, hidden_states, residual])
         # iterate dbo_contexts, equal to iterate layers
-        for batch_context in self.dbo_contexts:
-            hidden_states, residual = self.run_generator(
-                batch_context, attn_metadata, positions, hidden_states, residual, **kwargs)
+        for layer in self.layers:
+            hidden_states, residual = self.run_generator(layer, batch_context, attn_metadata, positions,
+                                                         hidden_states, residual, **kwargs)
         # merge outputs
         [hidden_states, residual] = self._merge_layer_outputs([hidden_states, residual])
         return hidden_states, residual
 
     @staticmethod
     def run_generator(
+        layer,
         batch_context: List[DualBatchOverlapContext],
         attn_metadata: Union[List[AscendMLAMetadata], List[AscendMetadata]],
         positions: List[torch.Tensor],
@@ -107,6 +104,7 @@ class DualBatchOverlapManager:
         """
         context_generators = []
         for i in range(len(positions)):
+            batch_context[i].origin_generator = layer.forward_generator
             # set attn_metadata
             batch_context[i].attn_metadata = attn_metadata[i]
             # init generator
