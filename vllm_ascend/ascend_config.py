@@ -51,6 +51,17 @@ class AscendConfig:
         self.enable_shared_expert_dp = additional_config.get(
             "enable_shared_expert_dp", False
         ) and not self.torchair_graph_config.enabled and vllm_config.parallel_config.enable_expert_parallel
+        self.enable_prefetch = additional_config.get("enable_prefetch", False)
+        self.lmhead_tensor_parallel_size = additional_config.get(
+            "lmhead_tensor_parallel_size", None)
+        if self.lmhead_tensor_parallel_size is not None:
+            logger.info(
+                f"Enable lmhead_tensor_parallel_size={self.lmhead_tensor_parallel_size} in pure DP scenario"
+            )
+            if vllm_config.parallel_config.tensor_parallel_size != 1:
+                raise AssertionError(
+                    "lmhead_tensor_parallel_size is only supported in the pure DP scenario"
+                )
 
         dual_batch_overlap_config = additional_config.get("dual_batch_overlap_config", {})
         self.dual_batch_overlap_config = DualBatchOverlapConfig(**dual_batch_overlap_config)
@@ -76,8 +87,11 @@ class TorchairGraphConfig:
 
     def __init__(self, torchair_graph_config):
         self.enabled = torchair_graph_config.get("enabled", False)
+        self.mode = torchair_graph_config.get("mode", '')
         self.use_cached_graph = torchair_graph_config.get(
             "use_cached_graph", False)
+        self.use_cached_kv_cache_bytes = torchair_graph_config.get(
+            "use_cached_kv_cache_bytes", False)
         self.graph_batch_sizes = torchair_graph_config.get(
             "graph_batch_sizes", [])
         self.graph_batch_sizes_init = torchair_graph_config.get(
@@ -97,9 +111,16 @@ class TorchairGraphConfig:
                 "graph_batch_sizes_init is only valid when graph_batch_sizes is empty"
             )
         if not self.enabled:
+            if self.mode:
+                raise RuntimeError(
+                    "mode is valid only when Torchair graph mode is enabled")
             if self.use_cached_graph:
                 raise RuntimeError(
                     "use_cached_graph is valid only when Torchair graph mode is enabled"
+                )
+            if self.use_cached_kv_cache_bytes:
+                raise RuntimeError(
+                    "use_cached_kv_cache_bytes is valid only when Torchair graph mode is enabled"
                 )
             if self.graph_batch_sizes:
                 raise RuntimeError(
@@ -121,6 +142,10 @@ class TorchairGraphConfig:
                 raise RuntimeError(
                     "enable_kv_nz is valid only when Torchair graph mode is enabled"
                 )
+        if self.use_cached_kv_cache_bytes and not self.use_cached_graph:
+            raise RuntimeError(
+                "use_cached_kv_cache_bytes is valid only when Torchair graph mode and use_cached_graph are enabled"
+            )
 
 
 class AscendSchedulerConfig:
