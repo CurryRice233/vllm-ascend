@@ -367,7 +367,9 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
         dbo_config = get_ascend_config().dual_batch_overlap_config
-        self.enable_dbo = dbo_config.enabled
+        # ascend scheduler support dbo num_micro_batches=1, default scheduler not support(accuracy issue)
+        # set dbo enabled when micro_batches is larger than 1
+        self.enable_dbo = dbo_config.enabled and dbo_config.num_micro_batches > 1
         if self.enable_dbo:
             self.dbo_manager = DualBatchOverlapManager(dbo_config, self.layers[self.start_layer:self.end_layer])
 
