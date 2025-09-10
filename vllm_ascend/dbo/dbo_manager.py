@@ -40,8 +40,9 @@ class DualBatchOverlapManager:
         self.layers = layers
         self.num_batch = dbo_config.num_micro_batches
         # batch -> context
-        self.dbo_contexts: List[DualBatchOverlapContext] = []
+        self.dbo_contexts: List[List[DualBatchOverlapContext]] = []
         self.use_mla = False
+        self.current_stream = torch.npu.current_stream()
         self.init_dbo_streams()
         self.init_dbo_contexts()
 
@@ -59,9 +60,12 @@ class DualBatchOverlapManager:
         each layer contains a batch of contexts, each contexts use its own stream.
         different layers can reuse contexts.
         """
-        for i in range(self.num_batch):
-            dbo_context = DualBatchOverlapContext(self.DBO_STREAMS[i])
-            self.dbo_contexts.append(dbo_context)
+        for layer in self.layers:
+            batch_dbo_context = []
+            for i in range(self.num_batch):
+                dbo_context = DualBatchOverlapContext(self.DBO_STREAMS[i], layer.forward_generator, None)
+                batch_dbo_context.append(dbo_context)
+            self.dbo_contexts.append(batch_dbo_context)
 
     def run_forward(
         self,
@@ -76,22 +80,31 @@ class DualBatchOverlapManager:
         # get attn_metadata
         attn_metadata = get_forward_context().attn_metadata
         self.use_mla = isinstance(attn_metadata, AscendMLAMetadata)
-        # set config
+        # set cls
         medata_cls = AscendMLAMetadata if self.use_mla else AscendMetadata
         # split attn_metadata、input_tensors
         attn_metadata, [positions, hidden_states, residual] = \
             self._split_layer_inputs(attn_metadata, medata_cls, self.dbo_config, [positions, hidden_states, residual])
+
+        # layer forward depends on word_embedding/pos_embedding/split data from current stream
+        self._wait_cur_stream()
+
         # iterate dbo_contexts, equal to iterate layers
-        for layer in self.layers:
+        for batch_context in self.dbo_contexts:
             hidden_states, residual = self.run_generator(
-                layer, attn_metadata, positions, hidden_states, residual, **kwargs)
+                batch_context, attn_metadata, positions, hidden_states, residual, **kwargs)
+        # merge data depends on dbo streams finished.
+        self._wait_dbo_streams()
+        # additional wait, need to be after wait_dbo_streams(), otherwise has mixed language outputs
+        self._wait_cur_stream()
+
         # merge outputs
         [hidden_states, residual] = self._merge_layer_outputs([hidden_states, residual])
         return hidden_states, residual
 
+    @staticmethod
     def run_generator(
-        self,
-        layer,
+        batch_context: List[DualBatchOverlapContext],
         attn_metadata: Union[List[AscendMLAMetadata], List[AscendMetadata]],
         positions: List[torch.Tensor],
         hidden_states: List[torch.Tensor],
@@ -103,11 +116,11 @@ class DualBatchOverlapManager:
         """
         context_generators = []
         for i in range(len(positions)):
-            self.dbo_contexts[i].origin_generator = layer.forward_generator
             # set attn_metadata
-            self.dbo_contexts[i].attn_metadata = attn_metadata[i]
+            batch_context[i].attn_metadata = attn_metadata[i]
             # init generator
-            context_generator = self.dbo_contexts[i].prepare_generator(positions[i], hidden_states[i], residual[i], **kwargs)
+            context_generator = batch_context[i].prepare_generator(
+                positions[i], hidden_states[i], residual[i], **kwargs)
             context_generators.append(context_generator)
         outputs = None
         hidden_states, residual = [], []
@@ -126,12 +139,14 @@ class DualBatchOverlapManager:
         _metadata_cls,
         dbo_config: DualBatchOverlapConfig,
         intput_tensors: List[Optional[torch.Tensor]],
-    ) -> Tuple[Union[List[AscendMLAMetadata], List[AscendMetadata]], List[List[torch.Tensor]]]:
+    ) -> Tuple[Union[List[AscendMLAMetadata], List[AscendMetadata], List[None]], List[List[torch.Tensor]]]:
         """
         split input info to num_batch
         return: Single or List of Metadata, such as AscendMLAMetadata、AscendMetadata.
                 List of input tensors
         """
+        if dbo_config.num_micro_batches < 2 or attn_metadata is None:
+            return [attn_metadata], [[intput_tensor] for intput_tensor in intput_tensors]
         # split attn_metadata, return a list, non-splittable if len of list is one,
         # otherwise return len is same as num_batch
         # TODO: need to support num_batch > 2
@@ -176,12 +191,17 @@ class DualBatchOverlapManager:
         """
         # none split, trans output format
         if len(attn_metadata) == 1:
-            out_tensors = []
-            for tensor in intput_tensors:
-                out_tensors.append([tensor])
-            return out_tensors
+            return [[intput_tensor] for intput_tensor in intput_tensors]
         # TODO: need to support num_batch > 2
         split_index = attn_metadata[0].slot_mapping.shape[0]
-        input_tensors = split_micro_batches_tensors(intput_tensors,
-                                                    split_index)
-        return input_tensors
+        return split_micro_batches_tensors(intput_tensors, split_index)
+
+    def _wait_dbo_streams(self):
+        """wait until all dbo streams finished"""
+        for dbo_stream in self.DBO_STREAMS:
+            self.current_stream.wait_stream(dbo_stream)
+
+    def _wait_cur_stream(self):
+        """wait until current stream finished"""
+        for dbo_stream in self.DBO_STREAMS:
+            dbo_stream.wait_stream(self.current_stream)
